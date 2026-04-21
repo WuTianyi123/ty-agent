@@ -47,6 +47,95 @@ _MSG_TYPE_POST = "post"
 # Dedup TTL
 _DEDUP_TTL_SECONDS = 24 * 60 * 60
 
+# ---------------------------------------------------------------------------
+# Markdown rendering helpers (inspired by hermes-agent)
+# ---------------------------------------------------------------------------
+
+# Detect markdown syntax hints to decide whether to send as post (rendered)
+# or plain text. Matches: headers, lists, code blocks, inline code, bold,
+# italic, strikethrough, underline, links, blockquotes.
+_MARKDOWN_HINT_RE = re.compile(
+    r"(^#{1,6}\s)|(^\s*[-*]\s)|(^\s*\d+\.\s)|(^\s*---+\s*$)|(```)|(`[^`\n]+`)|"
+    r"(\*\*[^*\n].+?\*\*)|(~~[^~\n].+?~~)|(<u>.+?</u>)|(\*[^*\n]+\*)|"
+    r"(\[[^\]]+\]\([^)]+\))|(^>\s)",
+    re.MULTILINE,
+)
+_MARKDOWN_FENCE_OPEN_RE = re.compile(r"^```([^\n`]*)\s*$")
+_MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
+_MARKDOWN_SPECIAL_CHARS_RE = re.compile(r"([\\`*_{}\[\]()#+\-!|>~])")
+
+
+def _escape_markdown_text(text: str) -> str:
+    """Escape markdown special characters so they render literally."""
+    return _MARKDOWN_SPECIAL_CHARS_RE.sub(r"\\\1", text)
+
+
+def _build_markdown_post_payload(content: str) -> str:
+    """Build a Feishu post payload with markdown rendering enabled."""
+    rows = _build_markdown_post_rows(content)
+    return json.dumps({"zh_cn": {"content": rows}}, ensure_ascii=False)
+
+
+def _build_markdown_post_rows(content: str) -> List[List[Dict[str, str]]]:
+    """Build Feishu post rows while isolating fenced code blocks.
+
+    Feishu's `md` renderer can swallow trailing content when a fenced code
+    block appears inside one large markdown element. Split the reply at real
+    fence lines so prose before/after the code block remains visible while
+    code stays in a dedicated row.
+    """
+    if not content:
+        return [[{"tag": "md", "text": ""}]]
+    if "```" not in content:
+        return [[{"tag": "md", "text": content}]]
+
+    rows: List[List[Dict[str, str]]] = []
+    current: List[str] = []
+    in_code_block = False
+
+    def _flush() -> None:
+        nonlocal current
+        if not current:
+            return
+        segment = "\n".join(current)
+        if segment.strip():
+            rows.append([{"tag": "md", "text": segment}])
+        current = []
+
+    for raw_line in content.splitlines():
+        stripped = raw_line.strip()
+        is_fence = bool(
+            _MARKDOWN_FENCE_CLOSE_RE.match(stripped)
+            if in_code_block
+            else _MARKDOWN_FENCE_OPEN_RE.match(stripped)
+        )
+
+        if is_fence:
+            if not in_code_block:
+                _flush()
+            current.append(raw_line)
+            in_code_block = not in_code_block
+            if not in_code_block:
+                _flush()
+            continue
+
+        current.append(raw_line)
+
+    _flush()
+    return rows or [[{"tag": "md", "text": content}]]
+
+
+def _build_outbound_payload(text: str) -> tuple[str, str]:
+    """Determine msg_type and payload for sending text to Feishu.
+
+    If the text contains markdown syntax, send as 'post' with md tag
+    so Feishu renders it (bold, italic, code blocks, etc.).
+    Otherwise send as plain 'text' for efficiency.
+    """
+    if _MARKDOWN_HINT_RE.search(text):
+        return "post", _build_markdown_post_payload(text)
+    return "text", json.dumps({"text": text}, ensure_ascii=False)
+
 
 try:
     import lark_oapi as lark
@@ -693,7 +782,7 @@ class FeishuAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Client not initialized")
 
-        content = json.dumps({"text": text}, ensure_ascii=False)
+        msg_type, payload = _build_outbound_payload(text)
         loop = asyncio.get_running_loop()
 
         def _sync_send() -> SendResult:
@@ -702,8 +791,8 @@ class FeishuAdapter(BasePlatformAdapter):
                     req = ReplyMessageRequest.builder() \
                         .message_id(reply_to_message_id) \
                         .request_body(ReplyMessageRequestBody.builder()
-                              .content(content)
-                              .msg_type("text")
+                              .content(payload)
+                              .msg_type(msg_type)
                               .build()) \
                         .build()
                     resp = self._client.im.v1.message.reply(req)
@@ -712,8 +801,8 @@ class FeishuAdapter(BasePlatformAdapter):
                         .receive_id_type("chat_id") \
                         .request_body(CreateMessageRequestBody.builder()
                               .receive_id(chat_id)
-                              .content(content)
-                              .msg_type("text")
+                              .content(payload)
+                              .msg_type(msg_type)
                               .build()) \
                         .build()
                     resp = self._client.im.v1.message.create(req)
@@ -752,23 +841,85 @@ def _map_msg_type(msg_type: str) -> MessageType:
 
 
 def _extract_post_text(content: dict) -> str:
-    """Extract plain text from a Feishu post message."""
+    """Extract text from a Feishu post message, preserving markdown styles.
+
+    Handles text elements with style attributes (bold, italic, underline,
+    strikethrough, code) and converts them to markdown syntax.
+    """
     texts = []
     try:
         post = content.get("post", {})
         for locale in ("zh_cn", "en_us", "ja_jp"):
             locale_content = post.get(locale, {})
             for row in locale_content.get("content", []):
+                row_parts = []
                 for elem in row:
                     tag = elem.get("tag", "")
                     if tag == "text":
-                        texts.append(elem.get("text", ""))
+                        row_parts.append(_render_post_text_element(elem))
                     elif tag == "a":
-                        texts.append(f"{elem.get('text', '')} ({elem.get('href', '')})")
+                        href = elem.get("href", "")
+                        label = elem.get("text", "")
+                        escaped = _escape_markdown_text(label) if label else ""
+                        row_parts.append(f"[{escaped}]({href})" if href and escaped else escaped or label)
                     elif tag == "at":
-                        texts.append(f"@{elem.get('user_name', elem.get('user_id', ''))}")
+                        name = elem.get("user_name", elem.get("user_id", ""))
+                        row_parts.append(f"@{name}")
                     elif tag == "img":
-                        texts.append("[Image]")
+                        row_parts.append("[Image]")
+                    elif tag == "code":
+                        code = elem.get("text", "")
+                        row_parts.append(_wrap_inline_code(code) if code else "")
+                    elif tag in ("code_block", "pre"):
+                        lang = str(elem.get("language", "") or elem.get("lang", "")).strip()
+                        code = str(elem.get("text", "") or elem.get("content", "")).replace("\r\n", "\n")
+                        trailing = "" if code.endswith("\n") else "\n"
+                        row_parts.append(f"```{lang}\n{code}{trailing}```")
+                    elif tag in ("br",):
+                        row_parts.append("\n")
+                    elif tag in ("hr", "divider"):
+                        row_parts.append("\n\n---\n\n")
+                if row_parts:
+                    texts.append("".join(row_parts))
     except Exception:
         pass
     return "\n".join(texts) or "[Post]"
+
+
+def _render_post_text_element(elem: dict) -> str:
+    """Render a single post text element with style to markdown."""
+    text = str(elem.get("text", "") or "")
+    style = elem.get("style")
+    style_dict = style if isinstance(style, dict) else None
+
+    # Inline code takes precedence over other styles
+    if _is_style_enabled(style_dict, "code"):
+        return _wrap_inline_code(text)
+
+    rendered = _escape_markdown_text(text)
+    if not rendered:
+        return ""
+    if _is_style_enabled(style_dict, "bold"):
+        rendered = f"**{rendered}**"
+    if _is_style_enabled(style_dict, "italic"):
+        rendered = f"*{rendered}*"
+    if _is_style_enabled(style_dict, "underline"):
+        rendered = f"<u>{rendered}</u>"
+    if _is_style_enabled(style_dict, "strikethrough"):
+        rendered = f"~~{rendered}~~"
+    return rendered
+
+
+def _is_style_enabled(style: dict | None, key: str) -> bool:
+    if not style:
+        return False
+    value = style.get(key)
+    return value is True or value == 1 or value == "true"
+
+
+def _wrap_inline_code(text: str) -> str:
+    """Wrap text in backticks, handling existing backtick runs."""
+    max_run = max([0, *[len(run) for run in re.findall(r"`+", text)]])
+    fence = "`" * (max_run + 1)
+    body = f" {text} " if text.startswith("`") or text.endswith("`") else text
+    return f"{fence}{body}{fence}"
