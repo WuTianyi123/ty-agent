@@ -10,7 +10,6 @@ Supports:
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
@@ -22,8 +21,6 @@ from typing import Any, Dict, List, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
-
-import aiohttp
 
 from ty_agent.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 
