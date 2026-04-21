@@ -253,7 +253,7 @@ def probe_bot(app_id: str, app_secret: str, domain: str) -> Optional[dict]:
             return None
         bot = bot_res.get("bot") or bot_res.get("data", {}).get("bot") or {}
         return {
-            "bot_name": bot.get("bot_name"),
+            "bot_name": bot.get("bot_name") or bot.get("app_name"),
             "bot_open_id": bot.get("open_id"),
         }
     except (URLError, OSError, KeyError, json.JSONDecodeError) as exc:
@@ -340,11 +340,14 @@ def _run_ws_client(ws_client: Any, adapter: Any) -> None:
     ws_client_module.loop = loop
     adapter._ws_thread_loop = loop
 
+    logger.info("WS client thread started")
     try:
         ws_client.start()
+        logger.info("WS client.start() returned normally (unexpected)")
     except Exception:
         logger.warning("Feishu WS client exited with error", exc_info=True)
     finally:
+        logger.info("WS client thread cleaning up")
         ws_client_module.loop = original_loop
         adapter._ws_thread_loop = None
         try:
@@ -612,7 +615,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_client = FeishuWSClient(
             app_id=self.app_id,
             app_secret=self.app_secret,
-            log_level=lark.LogLevel.WARNING,
+            log_level=lark.LogLevel.INFO,
             event_handler=event_handler,
             domain=sdk_domain,
         )
@@ -624,6 +627,11 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_future = loop.run_in_executor(
             None, _run_ws_client, self._ws_client, self
         )
+        try:
+            await self._ws_future
+        except asyncio.CancelledError:
+            logger.info("WS client task cancelled")
+            raise
 
     async def stop(self) -> None:
         self._running = False
