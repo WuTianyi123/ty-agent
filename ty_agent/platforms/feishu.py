@@ -486,9 +486,13 @@ class FeishuAdapter(BasePlatformAdapter):
         if msg_type == _MSG_TYPE_IMAGE:
             image_key = content.get("image_key", "")
             if image_key:
-                # Schedule image download as a background task
-                # We can't await here since this is a sync callback
-                pass  # Image download happens lazily or can be done in handler
+                event.media_urls = [image_key]
+                event.media_types = ["image"]
+        elif msg_type == _MSG_TYPE_FILE:
+            file_key = content.get("file_key", "")
+            if file_key:
+                event.media_urls = [file_key]
+                event.media_types = ["file"]
 
         return event
 
@@ -535,7 +539,10 @@ class FeishuAdapter(BasePlatformAdapter):
         self._loop = asyncio.get_running_loop()
 
         # Probe bot info
-        probe = probe_bot(self.app_id, self.app_secret, self.domain)
+        loop = asyncio.get_running_loop()
+        probe = await loop.run_in_executor(
+            None, probe_bot, self.app_id, self.app_secret, self.domain
+        )
         if probe:
             self._bot_name = probe.get("bot_name", "")
             self._bot_open_id = probe.get("bot_open_id", "")
