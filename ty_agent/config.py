@@ -169,3 +169,9 @@ def save_config(config: TyAgentConfig, path: Optional[Path] = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         yaml.dump(config.to_dict(), f, default_flow_style=False, allow_unicode=True)
+    # Restrict permissions so only owner can read
+    try:
+        import os
+        os.chmod(path, 0o600)
+    except OSError:
+        pass

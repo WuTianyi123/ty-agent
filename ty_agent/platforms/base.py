@@ -34,6 +34,7 @@ class MessageEvent:
 
     text: str
     message_type: MessageType = MessageType.TEXT
+    platform: str = ""  # Platform name (e.g., "feishu", "telegram")
     sender_id: Optional[str] = None
     sender_name: Optional[str] = None
     chat_id: Optional[str] = None

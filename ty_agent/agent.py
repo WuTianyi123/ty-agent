@@ -83,10 +83,10 @@ class TyAgent:
             return content or ""
         except httpx.HTTPStatusError as exc:
             logger.error("LLM API error: %s - %s", exc.response.status_code, exc.response.text)
-            return f"Error: LLM API returned {exc.response.status_code}"
+            raise AgentError(f"LLM API returned status {exc.response.status_code}") from exc
         except Exception as exc:
             logger.exception("LLM request failed")
-            return f"Error: {exc}"
+            raise AgentError(f"LLM request failed: {type(exc).__name__}") from exc
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -101,3 +101,8 @@ class TyAgent:
             max_turns=config.max_turns,
             system_prompt=config.system_prompt,
         )
+
+
+class AgentError(Exception):
+    """Raised when the AI agent encounters an error."""
+    pass

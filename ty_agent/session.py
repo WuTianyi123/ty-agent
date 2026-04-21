@@ -2,14 +2,30 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# Safe characters for session key filename
+_SAFE_SESSION_KEY_RE = re.compile(r"^[a-zA-Z0-9_:-]+$")
+
+
+def _sanitize_session_key(session_key: str) -> str:
+    """Sanitize session key for safe filesystem use.
+
+    If the key contains unsafe characters, hash it to prevent path traversal.
+    """
+    if _SAFE_SESSION_KEY_RE.match(session_key):
+        return session_key
+    return hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:32]
 
 
 @dataclass
@@ -74,7 +90,8 @@ class SessionStore:
     def delete(self, session_key: str) -> None:
         self._sessions.pop(session_key, None)
         if self._sessions_dir:
-            path = self._sessions_dir / f"{session_key}.json"
+            filename = _sanitize_session_key(session_key) + ".json"
+            path = self._sessions_dir / filename
             if path.exists():
                 path.unlink()
 
@@ -87,9 +104,15 @@ class SessionStore:
         session = self._sessions.get(session_key)
         if not session:
             return
-        path = self._sessions_dir / f"{session_key}.json"
+        filename = _sanitize_session_key(session_key) + ".json"
+        path = self._sessions_dir / filename
         with open(path, "w", encoding="utf-8") as f:
             json.dump(session.to_dict(), f, ensure_ascii=False, indent=2)
+        # Restrict permissions so only owner can read
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
 
     def _load_all(self) -> None:
         if not self._sessions_dir:

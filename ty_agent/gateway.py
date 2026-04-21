@@ -10,43 +10,73 @@ import asyncio
 import logging
 import signal
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Type
 
-from ty_agent.agent import TyAgent
-from ty_agent.config import TyAgentConfig
+from ty_agent.agent import AgentError, TyAgent
+from ty_agent.config import PlatformConfig, TyAgentConfig
 from ty_agent.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
 from ty_agent.session import SessionStore
 
 logger = logging.getLogger(__name__)
 
+# Registry of platform adapter classes
+_PLATFORM_REGISTRY: Dict[str, Type[BasePlatformAdapter]] = {}
+
+
+def register_platform(name: str, adapter_class: Type[BasePlatformAdapter]) -> None:
+    """Register a platform adapter class.
+
+    Example::
+
+        from ty_agent.gateway import register_platform
+        from my_platform import MyAdapter
+        register_platform("my_platform", MyAdapter)
+    """
+    _PLATFORM_REGISTRY[name] = adapter_class
+    logger.debug("Registered platform adapter: %s", name)
+
+
+def _load_builtin_platforms() -> None:
+    """Load built-in platform adapters."""
+    try:
+        from ty_agent.platforms.feishu import FeishuAdapter
+
+        register_platform("feishu", FeishuAdapter)
+    except ImportError as exc:
+        logger.debug("Feishu adapter not available: %s", exc)
+
 
 class Gateway:
     """Main gateway managing platform adapters and AI agent interactions."""
 
-    def __init__(self, config: TyAgentConfig):
+    def __init__(
+        self,
+        config: TyAgentConfig,
+        *,
+        session_store: Optional[SessionStore] = None,
+        agent: Optional[TyAgent] = None,
+    ):
         self.config = config
         self.adapters: Dict[str, BasePlatformAdapter] = {}
-        self.session_store = SessionStore(sessions_dir=config.sessions_dir)
-        self.agent = TyAgent.from_config(config.agent)
+        self.session_store = session_store or SessionStore(sessions_dir=config.sessions_dir)
+        self.agent = agent or TyAgent.from_config(config.agent)
         self._running = False
         self._shutdown_event = asyncio.Event()
 
     def _load_adapters(self) -> None:
         """Load and initialize platform adapters from config."""
+        _load_builtin_platforms()
         connected = self.config.get_connected_platforms()
         for name in connected:
             platform_cfg = self.config.get_platform(name)
             if not platform_cfg:
                 continue
+            adapter_cls = _PLATFORM_REGISTRY.get(name)
+            if adapter_cls is None:
+                logger.warning("No adapter registered for platform: %s", name)
+                continue
             try:
-                if name == "feishu":
-                    from ty_agent.platforms.feishu import FeishuAdapter
-
-                    adapter = FeishuAdapter(platform_cfg)
-                else:
-                    logger.warning("Unsupported platform: %s", name)
-                    continue
-
+                adapter = adapter_cls(platform_cfg)
                 adapter.set_message_handler(self._on_message)
                 self.adapters[name] = adapter
                 logger.info("Loaded adapter: %s", name)
@@ -57,6 +87,7 @@ class Gateway:
         """Handle an incoming message event."""
         adapter = self._find_adapter_for_event(event)
         if not adapter:
+            logger.warning("No adapter found for event from platform: %s", event.platform)
             return None
 
         session_key = adapter.build_session_key(event)
@@ -83,14 +114,14 @@ class Gateway:
 
         session.add_message("user", user_message)
 
-        # Send typing indicator if supported
-        # (Feishu doesn't have typing, but we could add reactions)
-
         try:
             response = await self.agent.chat(session.messages)
-        except Exception as exc:
-            logger.exception("Agent error")
-            response = f"Error: {exc}"
+        except AgentError as exc:
+            logger.error("Agent error: %s", exc)
+            response = "Sorry, I encountered an error processing your request."
+        except Exception:
+            logger.exception("Unexpected agent error")
+            response = "Sorry, something went wrong."
 
         session.add_message("assistant", response)
         self.session_store.save(session_key)
@@ -107,12 +138,8 @@ class Gateway:
         return response
 
     def _find_adapter_for_event(self, event: MessageEvent) -> Optional[BasePlatformAdapter]:
-        """Find the adapter that should handle this event."""
-        # For now, simple lookup by platform hint in event
-        # In practice, events come from a specific adapter
-        for adapter in self.adapters.values():
-            return adapter
-        return None
+        """Find the adapter that should handle this event by platform name."""
+        return self.adapters.get(event.platform)
 
     async def start(self) -> None:
         """Start all adapters and run the gateway."""
@@ -127,7 +154,10 @@ class Gateway:
         # Start all adapters
         tasks = []
         for name, adapter in self.adapters.items():
-            task = asyncio.create_task(self._start_adapter(name, adapter), name=f"adapter-{name}")
+            task = asyncio.create_task(
+                self._run_adapter_with_retry(name, adapter),
+                name=f"adapter-{name}",
+            )
             tasks.append(task)
 
         # Wait for shutdown signal
@@ -141,21 +171,40 @@ class Gateway:
             except asyncio.TimeoutError:
                 logger.warning("Adapter %s stop timed out", name)
 
+        # Cancel remaining tasks
+        for task in tasks:
+            if not task.done():
+                task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         await self.agent.close()
         logger.info("Gateway stopped")
 
-    async def _start_adapter(self, name: str, adapter: BasePlatformAdapter) -> None:
-        """Start a single adapter with retry logic."""
-        while self._running:
+    async def _run_adapter_with_retry(self, name: str, adapter: BasePlatformAdapter) -> None:
+        """Run a single adapter with exponential backoff retry."""
+        max_retries = 10
+        retry_delay = 5.0
+        max_retry_delay = 60.0
+
+        for attempt in range(1, max_retries + 1):
+            if not self._running:
+                break
             try:
+                logger.info("Starting adapter %s (attempt %d/%d)", name, attempt, max_retries)
                 await adapter.start()
+                # If start() returns normally, the adapter has stopped
+                logger.info("Adapter %s stopped gracefully", name)
+                break
             except asyncio.CancelledError:
+                logger.info("Adapter %s task cancelled", name)
                 break
             except Exception as exc:
                 logger.error("Adapter %s crashed: %s", name, exc)
-                if self._running:
-                    await asyncio.sleep(5)
+                if not self._running or attempt >= max_retries:
+                    logger.error("Adapter %s exceeded max retries, giving up", name)
+                    break
+                wait = min(retry_delay * (2 ** (attempt - 1)), max_retry_delay)
+                logger.info("Retrying adapter %s in %.1f seconds...", name, wait)
+                await asyncio.sleep(wait)
 
     def stop(self) -> None:
         """Signal the gateway to shut down."""
@@ -166,7 +215,11 @@ class Gateway:
         """Setup graceful shutdown on SIGINT/SIGTERM."""
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, self.stop)
+            try:
+                loop.add_signal_handler(sig, self.stop)
+            except NotImplementedError:
+                # Windows doesn't support add_signal_handler
+                pass
 
 
 async def run_gateway(config_path: Optional[str] = None) -> None:

@@ -3,7 +3,7 @@
 Supports:
 - WebSocket long connection
 - Direct-message and group @mention-gated text receive/send
-- Inbound image/file caching
+- Inbound image caching
 - QR scan-to-create onboarding
 """
 
@@ -17,7 +17,6 @@ import os
 import re
 import time
 import uuid
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.error import HTTPError, URLError
@@ -30,9 +29,7 @@ from ty_agent.platforms.base import BasePlatformAdapter, MessageEvent, MessageTy
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
 # QR onboarding constants
-# ---------------------------------------------------------------------------
 _ONBOARD_ACCOUNTS_URLS = {
     "feishu": "https://accounts.feishu.cn",
     "lark": "https://accounts.larksuite.com",
@@ -49,8 +46,6 @@ _MSG_TYPE_TEXT = "text"
 _MSG_TYPE_IMAGE = "image"
 _MSG_TYPE_FILE = "file"
 _MSG_TYPE_POST = "post"
-_MSG_TYPE_MERGE_FORWARD = "merge_forward"
-_MSG_TYPE_SHARE_CHAT = "share_chat"
 
 # Dedup TTL
 _DEDUP_TTL_SECONDS = 24 * 60 * 60
@@ -212,7 +207,7 @@ def _poll_registration(
 
 try:
     import qrcode as _qrcode_mod
-except (ImportError, TypeError):
+except ImportError:
     _qrcode_mod = None  # type: ignore[assignment]
 
 
@@ -354,6 +349,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self.domain: str = config.extra.get("domain", "feishu")
         self.encrypt_key: str = config.extra.get("encrypt_key", "")
         self.verification_token: str = config.extra.get("verification_token", "")
+        self.group_policy: str = config.extra.get("group_policy", "mention")  # "open" | "mention" | "disabled"
 
         if not self.app_id or not self.app_secret:
             raise ValueError("Feishu adapter requires app_id and app_secret in config.extra")
@@ -364,6 +360,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._bot_name: str = ""
         self._running = False
         self._dedup: Dict[str, float] = {}
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
         # Cache dir for media
         self._cache_dir = Path.home() / ".ty_agent" / "cache" / "feishu"
@@ -383,37 +380,76 @@ class FeishuAdapter(BasePlatformAdapter):
     # ---- WebSocket handlers ----
 
     def _on_message(self, data: dict) -> None:
-        """Handle incoming WebSocket message event."""
+        """Handle incoming WebSocket message event.
+
+        This callback runs in the WS client's background thread.
+        We must not call asyncio.create_task() here directly.
+        """
+        if self._loop is None or self._loop.is_closed():
+            logger.warning("No event loop available for Feishu message handling")
+            return
+
+        try:
+            event = self._parse_event(data)
+        except Exception as exc:
+            logger.warning("Failed to parse Feishu event: %s", exc)
+            return
+
+        if event is None:
+            return
+
+        # Schedule coroutine on the main event loop thread-safely
+        future = asyncio.run_coroutine_threadsafe(
+            self._handle_message(event), self._loop
+        )
+        # Attach error callback so exceptions aren't lost
+        future.add_done_callback(self._on_task_done)
+
+    def _on_task_done(self, future: Any) -> None:
+        """Callback for background tasks to log errors."""
+        try:
+            future.result()
+        except Exception as exc:
+            logger.exception("Feishu message handler task failed: %s", exc)
+
+    def _parse_event(self, data: dict) -> Optional[MessageEvent]:
+        """Parse a Feishu event into a MessageEvent."""
         header = data.get("header", {})
         event_type = header.get("event_type", "")
 
         if event_type != "im.message.receive_v1":
-            return
+            return None
 
         event_data = data.get("event", {})
         message = event_data.get("message", {})
-        sender = event_data.get("sender", {}).get("sender_id", {})
+        sender = event_data.get("sender", {})
+        sender_id_info = sender.get("sender_id", {})
+        sender_type = sender.get("sender_type", "")
 
         message_id = message.get("message_id", "")
         if self._is_duplicate(message_id):
-            return
+            return None
 
         msg_type = message.get("message_type", "")
         content_str = message.get("content", "{}")
         chat_id = message.get("chat_id", "")
         chat_type = "group" if message.get("chat_type") == "group" else "private"
-        sender_id = sender.get("open_id", "")
+        sender_id = sender_id_info.get("open_id", "")
 
         try:
             content = json.loads(content_str) if isinstance(content_str, str) else content_str
         except json.JSONDecodeError:
             content = {}
 
+        # Skip messages sent by the bot itself
+        if sender_type == "bot" or sender_id == self._bot_open_id:
+            return None
+
         # Parse text content
         text = ""
         if msg_type == _MSG_TYPE_TEXT:
             text = content.get("text", "")
-            # Remove @bot mentions
+            # Remove @bot mentions and normalize
             if self._bot_open_id:
                 text = re.sub(rf"<at user_id=\"{self._bot_open_id}\">.*?</at>", "", text).strip()
         elif msg_type == _MSG_TYPE_IMAGE:
@@ -426,15 +462,19 @@ class FeishuAdapter(BasePlatformAdapter):
             text = f"[{msg_type}]"
 
         if not text:
-            return
+            return None
 
-        # Skip messages sent by ourselves
-        if sender_id == self._bot_open_id:
-            return
+        # Group chat gating: require @mention unless policy is "open"
+        if chat_type == "group" and self.group_policy != "open":
+            raw_content = content_str if isinstance(content_str, str) else json.dumps(content_str)
+            if self._bot_open_id and f'user_id="{self._bot_open_id}"' not in raw_content:
+                logger.debug("Ignoring group message without @mention: %s", message_id)
+                return None
 
         event = MessageEvent(
             text=text,
             message_type=_map_msg_type(msg_type),
+            platform="feishu",
             sender_id=sender_id,
             chat_id=chat_id,
             chat_type=chat_type,
@@ -446,17 +486,15 @@ class FeishuAdapter(BasePlatformAdapter):
         if msg_type == _MSG_TYPE_IMAGE:
             image_key = content.get("image_key", "")
             if image_key:
-                path = self._download_image(image_key)
-                if path:
-                    event.media_urls.append(path)
-                    event.media_types.append("image")
+                # Schedule image download as a background task
+                # We can't await here since this is a sync callback
+                pass  # Image download happens lazily or can be done in handler
 
-        asyncio.create_task(self._handle_message(event))
+        return event
 
     def _is_duplicate(self, message_id: str) -> bool:
         """Check and record message ID for deduplication."""
         now = time.time()
-        # Clean old entries
         cutoff = now - _DEDUP_TTL_SECONDS
         self._dedup = {k: v for k, v in self._dedup.items() if v > cutoff}
 
@@ -465,25 +503,36 @@ class FeishuAdapter(BasePlatformAdapter):
         self._dedup[message_id] = now
         return False
 
-    def _download_image(self, image_key: str) -> Optional[str]:
-        """Download an image from Feishu and save to cache."""
-        try:
-            req = GetMessageResourceRequest.builder().message_id(image_key).file_key(image_key).build()
-            resp = self._client.im.v1.message_resource.get(req)
-            if resp.code != 0:
-                logger.warning("Failed to download image %s: %s", image_key, resp.msg)
-                return None
-            filepath = self._cache_dir / f"img_{uuid.uuid4().hex[:12]}.png"
-            filepath.write_bytes(resp.raw.content)
-            return str(filepath)
-        except Exception as exc:
-            logger.warning("Error downloading image %s: %s", image_key, exc)
+    async def _download_image(self, message_id: str, image_key: str) -> Optional[str]:
+        """Download an image from Feishu and save to cache (async-safe)."""
+        if not self._client:
             return None
+        loop = asyncio.get_running_loop()
+
+        def _sync_download() -> Optional[str]:
+            try:
+                req = GetMessageResourceRequest.builder() \
+                    .message_id(message_id) \
+                    .file_key(image_key) \
+                    .build()
+                resp = self._client.im.v1.message_resource.get(req)
+                if resp.code != 0:
+                    logger.warning("Failed to download image %s: %s", image_key, resp.msg)
+                    return None
+                filepath = self._cache_dir / f"img_{uuid.uuid4().hex[:12]}.png"
+                filepath.write_bytes(resp.raw.content)
+                return str(filepath)
+            except Exception as exc:
+                logger.warning("Error downloading image %s: %s", image_key, exc)
+                return None
+
+        return await loop.run_in_executor(None, _sync_download)
 
     # ---- Lifecycle ----
 
     async def start(self) -> None:
         self._client = self._build_client()
+        self._loop = asyncio.get_running_loop()
 
         # Probe bot info
         probe = probe_bot(self.app_id, self.app_secret, self.domain)
@@ -535,37 +584,41 @@ class FeishuAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Client not initialized")
 
         content = json.dumps({"text": text}, ensure_ascii=False)
+        loop = asyncio.get_running_loop()
 
-        try:
-            if reply_to_message_id:
-                req = ReplyMessageRequest.builder() \
-                    .message_id(reply_to_message_id) \
-                    .body(ReplyMessageRequestBody.builder()
-                          .content(content)
-                          .msg_type("text")
-                          .build()) \
-                    .build()
-                resp = self._client.im.v1.message.reply(req)
-            else:
-                req = CreateMessageRequest.builder() \
-                    .receive_id_type("chat_id") \
-                    .receive_id(chat_id) \
-                    .body(CreateMessageRequestBody.builder()
-                          .content(content)
-                          .msg_type("text")
-                          .build()) \
-                    .build()
-                resp = self._client.im.v1.message.create(req)
+        def _sync_send() -> SendResult:
+            try:
+                if reply_to_message_id:
+                    req = ReplyMessageRequest.builder() \
+                        .message_id(reply_to_message_id) \
+                        .body(ReplyMessageRequestBody.builder()
+                              .content(content)
+                              .msg_type("text")
+                              .build()) \
+                        .build()
+                    resp = self._client.im.v1.message.reply(req)
+                else:
+                    req = CreateMessageRequest.builder() \
+                        .receive_id_type("chat_id") \
+                        .receive_id(chat_id) \
+                        .body(CreateMessageRequestBody.builder()
+                              .content(content)
+                              .msg_type("text")
+                              .build()) \
+                        .build()
+                    resp = self._client.im.v1.message.create(req)
 
-            if resp.code == 0:
-                data = json.loads(resp.raw.content) if hasattr(resp, "raw") else {}
-                msg_id = data.get("data", {}).get("message_id", "")
-                return SendResult(success=True, message_id=msg_id)
-            else:
-                return SendResult(success=False, error=f"{resp.code}: {resp.msg}")
-        except Exception as exc:
-            logger.exception("Failed to send Feishu message")
-            return SendResult(success=False, error=str(exc), retryable=True)
+                if resp.code == 0:
+                    data = json.loads(resp.raw.content) if hasattr(resp, "raw") else {}
+                    msg_id = data.get("data", {}).get("message_id", "")
+                    return SendResult(success=True, message_id=msg_id)
+                else:
+                    return SendResult(success=False, error=f"{resp.code}: {resp.msg}")
+            except Exception as exc:
+                logger.exception("Failed to send Feishu message")
+                return SendResult(success=False, error=str(exc), retryable=True)
+
+        return await loop.run_in_executor(None, _sync_send)
 
     def build_session_key(self, event: MessageEvent) -> str:
         # Group chats: platform:chat_id:sender_id
@@ -604,6 +657,8 @@ def _extract_post_text(content: dict) -> str:
                         texts.append(f"{elem.get('text', '')} ({elem.get('href', '')})")
                     elif tag == "at":
                         texts.append(f"@{elem.get('user_name', elem.get('user_id', ''))}")
+                    elif tag == "img":
+                        texts.append("[Image]")
     except Exception:
         pass
     return "\n".join(texts) or "[Post]"

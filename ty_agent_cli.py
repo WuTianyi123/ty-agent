@@ -76,11 +76,28 @@ def cmd_setup_feishu(args: argparse.Namespace) -> int:
 
 
 def cmd_config(args: argparse.Namespace) -> int:
-    """Show current configuration."""
+    """Show current configuration (sensitive values redacted)."""
     config = load_config(Path(args.config) if args.config else None)
-    import yaml
+    import copy
 
-    print(yaml.dump(config.to_dict(), default_flow_style=False, allow_unicode=True))
+    data = copy.deepcopy(config.to_dict())
+
+    # Redact sensitive fields
+    def _redact(obj: Any) -> Any:
+        if isinstance(obj, dict):
+            result = {}
+            for k, v in obj.items():
+                if any(s in k.lower() for s in ("secret", "token", "api_key", "password", "key")):
+                    result[k] = "***" if v else v
+                else:
+                    result[k] = _redact(v)
+            return result
+        if isinstance(obj, list):
+            return [_redact(i) for i in obj]
+        return obj
+
+    redacted = _redact(data)
+    print(yaml.dump(redacted, default_flow_style=False, allow_unicode=True))
     return 0
 
 
