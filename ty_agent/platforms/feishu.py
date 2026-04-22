@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -515,12 +516,40 @@ class FeishuAdapter(BasePlatformAdapter):
         self._bot_open_id: Optional[str] = None
         self._bot_name: str = ""
         self._running = False
-        self._dedup: Dict[str, float] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
-        # Cache dir for media
+        # Cache dir for media and dedup state
         self._cache_dir = Path.home() / ".ty_agent" / "cache" / "feishu"
         self._cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # Persistent message dedup state
+        self._dedup_path = self._cache_dir / "seen_message_ids.json"
+        self._dedup_lock = threading.Lock()
+        self._dedup: Dict[str, float] = self._load_dedup()
+
+    def _load_dedup(self) -> Dict[str, float]:
+        """Load deduplication state from disk, pruning expired entries."""
+        if not self._dedup_path.exists():
+            return {}
+        try:
+            with open(self._dedup_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return {}
+            cutoff = time.time() - _DEDUP_TTL_SECONDS
+            # Prune expired entries on load
+            return {k: float(v) for k, v in data.items() if float(v) > cutoff}
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            logger.warning("Failed to load dedup state: %s", exc)
+            return {}
+
+    def _save_dedup(self) -> None:
+        """Save deduplication state to disk."""
+        try:
+            with open(self._dedup_path, "w", encoding="utf-8") as f:
+                json.dump(self._dedup, f, ensure_ascii=False)
+        except OSError as exc:
+            logger.warning("Failed to save dedup state: %s", exc)
 
     def _build_client(self) -> Any:
         sdk_domain = LARK_DOMAIN if self.domain == "lark" else FEISHU_DOMAIN
@@ -679,15 +708,19 @@ class FeishuAdapter(BasePlatformAdapter):
         return event
 
     def _is_duplicate(self, message_id: str) -> bool:
-        """Check and record message ID for deduplication."""
+        """Check and record message ID for deduplication (persisted to disk)."""
         now = time.time()
         cutoff = now - _DEDUP_TTL_SECONDS
-        self._dedup = {k: v for k, v in self._dedup.items() if v > cutoff}
 
-        if message_id in self._dedup:
-            return True
-        self._dedup[message_id] = now
-        return False
+        with self._dedup_lock:
+            # Prune expired entries
+            self._dedup = {k: v for k, v in self._dedup.items() if v > cutoff}
+
+            if message_id in self._dedup:
+                return True
+            self._dedup[message_id] = now
+            self._save_dedup()
+            return False
 
     async def _download_image(self, message_id: str, image_key: str) -> Optional[str]:
         """Download an image from Feishu and save to cache (async-safe)."""
