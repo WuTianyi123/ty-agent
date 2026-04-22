@@ -26,13 +26,13 @@
 - Markdown → Feishu post 自动转换（代码块、粗体、斜体、链接等）
 - 群聊 @mention 门控
 - 自身消息过滤
-- 消息去重（24h TTL）
+- 消息去重持久化（24h TTL，保存到 ~/.ty_agent/cache/feishu/seen_message_ids.json）
 
 ---
 
 ## 已核实问题状态
 
-### 已修复（6个）
+### 已修复（7个）
 
 1. WebSocket 回调线程安全 — 使用 run_coroutine_threadsafe，不是 create_task
 2. 图片下载 API 参数 — message_id 和 file_key 分开传
@@ -40,10 +40,10 @@
 4. 自身消息识别 — 检查 sender_type == "bot" 和 sender_id
 5. Markdown/富文本发送 — _build_outbound_payload 检测 Markdown 语法自动发 post
 6. gateway.py 路由 — 按 event.platform 查找适配器
+7. 消息去重持久化 — 保存到磁盘 JSON，启动时加载，线程安全锁保护
 
-### 仍存在（5个）
+### 仍存在（4个）
 
-7. 消息去重不可持久化 — 内存字典，重启丢失（有 TTL 清理）
 8. 媒体下载拓展名硬编码 — 总是 .png，不根据 Content-Type 判断
 9. 媒体下载类型单一 — 只有 _download_image，无 file/audio/video
 10. 消息解析缺少媒体标签 — 缺少 media/file/audio/video 标签解析
@@ -53,10 +53,9 @@
 
 ## 近期计划
 
-1. 消息去重持久化到磁盘
-2. 媒体下载支持多类型和正确扩展名
-3. 完善 Post 消息解析（media/file/audio/video 标签）
-4. 实现 Feishu 图片/文件上传（send_photo/send_document 覆盖）
+1. 媒体下载支持多类型和正确扩展名
+2. 完善 Post 消息解析（media/file/audio/video 标签）
+3. 实现 Feishu 图片/文件上传（send_photo/send_document 覆盖）
 
 ---
 
