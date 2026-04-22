@@ -78,7 +78,8 @@ def _generate_unit() -> str:
     
     env_lines = []
     for key, value in os.environ.items():
-        if key in ("PATH", "HOME", "USER", "OPENAI_API_KEY", "KIMI_API_KEY", 
+        # Exclude HOME — gateway will set it to profile_home at runtime
+        if key in ("PATH", "USER", "OPENAI_API_KEY", "KIMI_API_KEY", 
                     "ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY", "OPENROUTER_API_KEY"):
             env_lines.append(f'Environment="{key}={value}"')
     

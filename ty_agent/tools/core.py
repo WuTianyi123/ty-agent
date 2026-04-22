@@ -702,6 +702,8 @@ def _handle_terminal(args: Dict[str, Any]) -> str:
             return tool_error(f"Invalid workdir '{workdir}': {exc}")
 
     try:
+        # Ensure isolated HOME is inherited by subprocess
+        env = os.environ.copy()
         proc = subprocess.run(
             command,
             shell=True,
@@ -709,6 +711,7 @@ def _handle_terminal(args: Dict[str, Any]) -> str:
             text=True,
             timeout=timeout,
             cwd=cwd,
+            env=env,
         )
         output = proc.stdout
         stderr = proc.stderr
@@ -793,12 +796,15 @@ def _handle_execute_code(args: Dict[str, Any]) -> str:
     try:
         # Use the same Python interpreter
         python = os.environ.get("PYTHON", sys.executable)
+        # Ensure isolated HOME is inherited by subprocess
+        env = os.environ.copy()
         proc = subprocess.run(
             [python, temp_path],
             capture_output=True,
             text=True,
             timeout=timeout,
             cwd=os.getcwd(),
+            env=env,
         )
         output = proc.stdout
         stderr = proc.stderr

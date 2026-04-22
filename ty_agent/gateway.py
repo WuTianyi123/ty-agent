@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 import sys
 from typing import Any, Dict, List, Optional, Type
@@ -273,6 +274,49 @@ async def run_gateway(config_path: Optional[str] = None) -> None:
         level=getattr(logging, config.log_level.upper(), logging.INFO),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+
+    # Initialize profile home directory (isolated shell home for git/ssh/etc)
+    profile_home = config.home_dir / "home"
+    profile_home.mkdir(parents=True, exist_ok=True)
+    
+    # Initialize basic gitconfig if not exists
+    gitconfig = profile_home / ".gitconfig"
+    if not gitconfig.exists():
+        gitconfig.write_text(
+            "[user]\n"
+            "    name = ty-agent\n"
+            "    email = agent@ty-agent.local\n",
+            encoding="utf-8"
+        )
+    
+    # Initialize .ssh directory
+    ssh_dir = profile_home / ".ssh"
+    ssh_dir.mkdir(parents=True, exist_ok=True)
+    ssh_dir.chmod(0o700)
+    
+    # Determine real user home (using passwd entry, not $HOME which may be profile home)
+    real_home = os.path.expanduser("~")
+    try:
+        import pwd
+        real_home = pwd.getpwuid(os.getuid()).pw_dir
+    except (ImportError, KeyError):
+        pass
+    
+    # Set HOME to profile home for consistent isolation (gateway + subprocesses)
+    os.environ["HOME"] = str(profile_home)
+    # Preserve real home for tools that need to access user's actual files
+    os.environ["TY_AGENT_REAL_HOME"] = str(real_home)
+    logger.info("Profile home initialized at: %s", profile_home)
+    logger.info("Real home available via TY_AGENT_REAL_HOME: %s", real_home)
+
+    # Change to workspace directory
+    workspace = config.workspace_dir
+    try:
+        os.chdir(workspace)
+        logger.info("Working directory set to: %s", workspace)
+    except OSError as exc:
+        logger.error("Failed to change to workspace directory %s: %s", workspace, exc)
+        raise
 
     gateway = Gateway(config)
     gateway._setup_signal_handlers()

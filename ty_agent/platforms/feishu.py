@@ -60,6 +60,9 @@ _MARKDOWN_HINT_RE = re.compile(
     r"(\[[^\]]+\]\([^)]+\))|(^>\s)",
     re.MULTILINE,
 )
+# Detect markdown tables: a line starting with | followed by a separator line.
+# Feishu post-type 'md' elements do not render tables, so we force text mode.
+_MARKDOWN_TABLE_RE = re.compile(r"^\|.*\|\n\|[-|: ]+\|", re.MULTILINE)
 _MARKDOWN_FENCE_OPEN_RE = re.compile(r"^```([^\n`]*)\s*$")
 _MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
 _MARKDOWN_SPECIAL_CHARS_RE = re.compile(r"([\\`*_{}\[\]()#+\-!|>~])")
@@ -83,15 +86,20 @@ def _build_markdown_post_rows(content: str) -> List[List[Dict[str, str]]]:
     block appears inside one large markdown element. Split the reply at real
     fence lines so prose before/after the code block remains visible while
     code stays in a dedicated row.
+
+    Uses fence char + length matching to avoid mis-interpreting inner fences
+    (e.g. a ``` line inside a `````` block is content, not a close fence).
     """
     if not content:
         return [[{"tag": "md", "text": ""}]]
-    if "```" not in content:
+    if "```" not in content and "~~~" not in content:
         return [[{"tag": "md", "text": content}]]
 
     rows: List[List[Dict[str, str]]] = []
     current: List[str] = []
     in_code_block = False
+    fence_char = ""  # '`' or '~'
+    fence_len = 0    # length of opening fence
 
     def _flush() -> None:
         nonlocal current
@@ -104,11 +112,22 @@ def _build_markdown_post_rows(content: str) -> List[List[Dict[str, str]]]:
 
     for raw_line in content.splitlines():
         stripped = raw_line.strip()
-        is_fence = bool(
-            _MARKDOWN_FENCE_CLOSE_RE.match(stripped)
-            if in_code_block
-            else _MARKDOWN_FENCE_OPEN_RE.match(stripped)
-        )
+        leading_spaces = len(raw_line) - len(raw_line.lstrip(" "))
+
+        is_fence = False
+        if in_code_block:
+            # Close fence: same char, same or longer length, indent <= 3
+            if leading_spaces <= 3:
+                m = re.match(rf"^({re.escape(fence_char)}{{3,}})\s*$", stripped)
+                if m and len(m.group(1)) >= fence_len:
+                    is_fence = True
+        else:
+            # Open fence: 3+ backticks or tildes, optional lang tag
+            m = re.match(r"^(```+|~~~+)([^`\n]*)\s*$", stripped)
+            if m:
+                is_fence = True
+                fence_char = m.group(1)[0]  # '`' or '~'
+                fence_len = len(m.group(1))
 
         if is_fence:
             if not in_code_block:
@@ -116,6 +135,8 @@ def _build_markdown_post_rows(content: str) -> List[List[Dict[str, str]]]:
             current.append(raw_line)
             in_code_block = not in_code_block
             if not in_code_block:
+                fence_char = ""
+                fence_len = 0
                 _flush()
             continue
 
@@ -132,6 +153,11 @@ def _build_outbound_payload(text: str) -> tuple[str, str]:
     so Feishu renders it (bold, italic, code blocks, etc.).
     Otherwise send as plain 'text' for efficiency.
     """
+    # Feishu post-type 'md' elements do not render markdown tables; sending
+    # table content as post causes the message to appear blank on the client.
+    # Force plain text for anything that looks like a markdown table.
+    if _MARKDOWN_TABLE_RE.search(text):
+        return "text", json.dumps({"text": text}, ensure_ascii=False)
     if _MARKDOWN_HINT_RE.search(text):
         return "post", _build_markdown_post_payload(text)
     return "text", json.dumps({"text": text}, ensure_ascii=False)
@@ -783,28 +809,52 @@ class FeishuAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Client not initialized")
 
         msg_type, payload = _build_outbound_payload(text)
+        result = await self._sync_send(chat_id, msg_type, payload, reply_to_message_id)
+
+        # Fallback: if post was rejected, try plain text to avoid losing the message
+        if not result.success and msg_type == "post":
+            logger.warning(
+                "[Feishu] Post send failed (%s), falling back to plain text", result.error
+            )
+            fallback_payload = json.dumps({"text": text}, ensure_ascii=False)
+            result = await self._sync_send(chat_id, "text", fallback_payload, reply_to_message_id)
+
+        return result
+
+    async def _sync_send(
+        self, chat_id: str, msg_type: str, payload: str, reply_to_message_id: Optional[str]
+    ) -> SendResult:
+        """Synchronous send wrapped in executor."""
         loop = asyncio.get_running_loop()
 
-        def _sync_send() -> SendResult:
+        def _do_send() -> SendResult:
             try:
                 if reply_to_message_id:
-                    req = ReplyMessageRequest.builder() \
-                        .message_id(reply_to_message_id) \
-                        .request_body(ReplyMessageRequestBody.builder()
-                              .content(payload)
-                              .msg_type(msg_type)
-                              .build()) \
+                    req = (
+                        ReplyMessageRequest.builder()
+                        .message_id(reply_to_message_id)
+                        .request_body(
+                            ReplyMessageRequestBody.builder()
+                            .content(payload)
+                            .msg_type(msg_type)
+                            .build()
+                        )
                         .build()
+                    )
                     resp = self._client.im.v1.message.reply(req)
                 else:
-                    req = CreateMessageRequest.builder() \
-                        .receive_id_type("chat_id") \
-                        .request_body(CreateMessageRequestBody.builder()
-                              .receive_id(chat_id)
-                              .content(payload)
-                              .msg_type(msg_type)
-                              .build()) \
+                    req = (
+                        CreateMessageRequest.builder()
+                        .receive_id_type("chat_id")
+                        .request_body(
+                            CreateMessageRequestBody.builder()
+                            .receive_id(chat_id)
+                            .content(payload)
+                            .msg_type(msg_type)
+                            .build()
+                        )
                         .build()
+                    )
                     resp = self._client.im.v1.message.create(req)
 
                 if resp.code == 0:
@@ -817,7 +867,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 logger.exception("Failed to send Feishu message")
                 return SendResult(success=False, error=str(exc), retryable=True)
 
-        return await loop.run_in_executor(None, _sync_send)
+        return await loop.run_in_executor(None, _do_send)
 
     def build_session_key(self, event: MessageEvent) -> str:
         # Group chats: platform:chat_id:sender_id
