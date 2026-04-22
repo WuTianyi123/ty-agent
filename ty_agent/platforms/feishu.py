@@ -530,15 +530,23 @@ class FeishuAdapter(BasePlatformAdapter):
     def _load_dedup(self) -> Dict[str, float]:
         """Load deduplication state from disk, pruning expired entries."""
         if not self._dedup_path.exists():
+            logger.info("No dedup state file found, starting fresh")
             return {}
         try:
             with open(self._dedup_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if not isinstance(data, dict):
+                logger.warning("Dedup state file corrupted, starting fresh")
                 return {}
             cutoff = time.time() - _DEDUP_TTL_SECONDS
             # Prune expired entries on load
-            return {k: float(v) for k, v in data.items() if float(v) > cutoff}
+            pruned = {k: float(v) for k, v in data.items() if float(v) > cutoff}
+            dropped = len(data) - len(pruned)
+            if dropped:
+                logger.info("Loaded %d dedup entries, pruned %d expired", len(pruned), dropped)
+            else:
+                logger.info("Loaded %d dedup entries", len(pruned))
+            return pruned
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             logger.warning("Failed to load dedup state: %s", exc)
             return {}
@@ -548,8 +556,35 @@ class FeishuAdapter(BasePlatformAdapter):
         try:
             with open(self._dedup_path, "w", encoding="utf-8") as f:
                 json.dump(self._dedup, f, ensure_ascii=False)
+            logger.debug("Saved %d dedup entries to %s", len(self._dedup), self._dedup_path)
         except OSError as exc:
             logger.warning("Failed to save dedup state: %s", exc)
+
+    def _is_duplicate(self, message_id: str) -> bool:
+        """Check and record message ID for deduplication (persisted to disk)."""
+        now = time.time()
+        cutoff = now - _DEDUP_TTL_SECONDS
+
+        with self._dedup_lock:
+            # Prune expired entries
+            before = len(self._dedup)
+            self._dedup = {k: v for k, v in self._dedup.items() if v > cutoff}
+            pruned = before - len(self._dedup)
+
+            if message_id in self._dedup:
+                if pruned:
+                    logger.debug("Duplicate message %s (pruned %d expired)", message_id, pruned)
+                else:
+                    logger.debug("Duplicate message %s", message_id)
+                return True
+            self._dedup[message_id] = now
+            self._save_dedup()
+            if pruned:
+                logger.debug("New message %s recorded (pruned %d expired, total %d)",
+                             message_id, pruned, len(self._dedup))
+            else:
+                logger.debug("New message %s recorded (total %d)", message_id, len(self._dedup))
+            return False
 
     def _build_client(self) -> Any:
         sdk_domain = LARK_DOMAIN if self.domain == "lark" else FEISHU_DOMAIN
