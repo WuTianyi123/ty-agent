@@ -27,12 +27,14 @@
 - 群聊 @mention 门控
 - 自身消息过滤
 - 消息去重持久化（24h TTL，保存到 ~/.ty_agent/cache/feishu/seen_message_ids.json）
+- 入站媒体下载：支持 image/file/audio/media，自动推断扩展名
+- 出站媒体发送：send_photo / send_document 通过 Feishu 上传 API 实现
 
 ---
 
 ## 已核实问题状态
 
-### 已修复（7个）
+### 已修复（11个）
 
 1. WebSocket 回调线程安全 — 使用 run_coroutine_threadsafe，不是 create_task
 2. 图片下载 API 参数 — message_id 和 file_key 分开传
@@ -41,21 +43,24 @@
 5. Markdown/富文本发送 — _build_outbound_payload 检测 Markdown 语法自动发 post
 6. gateway.py 路由 — 按 event.platform 查找适配器
 7. 消息去重持久化 — 保存到磁盘 JSON，启动时加载，线程安全锁保护
+8. 媒体下载拓展名 — 根据 Content-Type 和 filename 推断，支持 image/file/audio/media
+9. Post 消息媒体标签 — 支持 img/media/file/audio/video 标签解析
+10. send_photo — 上传图片到 Feishu 后发送 image 类型消息
+11. send_document — 上传文件到 Feishu 后发送 file 类型消息
 
-### 仍存在（4个）
+### 仍存在（0个）
 
-8. 媒体下载拓展名硬编码 — 总是 .png，不根据 Content-Type 判断
-9. 媒体下载类型单一 — 只有 _download_image，无 file/audio/video
-10. 消息解析缺少媒体标签 — 缺少 media/file/audio/video 标签解析
-11. send_photo/send_document 只发文本路径 — 未用 Feishu 图片/文件上传 API
+所有已知问题已修复。
 
 ---
 
 ## 近期计划
 
-1. 媒体下载支持多类型和正确扩展名
-2. 完善 Post 消息解析（media/file/audio/video 标签）
-3. 实现 Feishu 图片/文件上传（send_photo/send_document 覆盖）
+1. ~~媒体下载支持多类型和正确扩展名~~ ✅
+2. ~~完善 Post 消息解析（media/file/audio/video 标签）~~ ✅
+3. ~~实现 Feishu 图片/文件上传（send_photo/send_document 覆盖）~~ ✅
+4. 持续测试和稳定性改进
+5. 考虑添加更多平台适配器（Telegram、Discord 等）
 
 ---
 
